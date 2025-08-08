@@ -1,0 +1,134 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  SERVICE_NAME: counter-app
+  GCP_REGION: us-central1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run tests
+        run: npm test
+
+      - name: Check build tag
+        run: |
+          echo "SERVICE_NAME=${{ env.SERVICE_NAME }}"
+          echo "GITHUB_SHA=${{ github.sha }}"
+          if [ -z "${{ env.SERVICE_NAME }}" ] || [ -z "${{ github.sha }}" ]; then
+            echo "❌ Missing required tag inputs"
+            exit 1
+          fi
+
+      - name: Build Docker image
+        run: |
+          TAG=${{ github.sha }}
+          echo "Building image: ${{ env.SERVICE_NAME }}:$TAG"
+          docker build -t ${{ env.SERVICE_NAME }}:$TAG .
+
+      - name: Test Docker container
+        run: |
+          TAG=${{ github.sha }}
+          PORT=$(( ( RANDOM % 1000 )  + 8000 ))
+          docker run -d -p $PORT:3001 --name test-container ${{ env.SERVICE_NAME }}:$TAG
+          sleep 10
+          curl -f http://localhost:$PORT || (docker logs test-container && exit 1)
+          docker stop test-container
+          docker rm test-container
+
+  build-and-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate GCP_PROJECT_ID
+        run: |
+          if [ -z "${{ secrets.GCP_PROJECT_ID }}" ]; then
+            echo "❌ GCP_PROJECT_ID is not set. Please add it to GitHub Secrets."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v1
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev
+
+      - name: Ensure Docker repository exists
+        run: |
+          REPO=${{ env.SERVICE_NAME }}
+          gcloud artifacts repositories describe $REPO \
+            --location=${{ env.GCP_REGION }} >/dev/null 2>&1 || \
+          gcloud artifacts repositories create $REPO \
+            --repository-format=docker \
+            --location=${{ env.GCP_REGION }} \
+            --description="Container repo for $REPO"
+
+      - name: Build and push Docker image
+        run: |
+          PROJECT_ID=$(echo "${{ secrets.GCP_PROJECT_ID }}" | tr -d '\n\r')
+          REGION="${{ env.GCP_REGION }}"
+          SERVICE="${{ env.SERVICE_NAME }}"
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${SERVICE}/${SERVICE}"
+          echo "Building image: ${IMAGE}:${{ github.sha }}"
+          docker build -t "${IMAGE}:${{ github.sha }}" -t "${IMAGE}:latest" .
+          docker push "${IMAGE}:${{ github.sha }}"
+          docker push "${IMAGE}:latest"
+
+      - name: Deploy to Cloud Run
+        run: |
+          PROJECT_ID=$(echo "" | tr -d '\n\r')
+          REGION=""
+          SERVICE=""
+      - name: Deploy to Cloud Run
+        run: |
+          PROJECT_ID=$(echo "${{ secrets.GCP_PROJECT_ID }}" | tr -d '\n\r')
+          REGION="${{ env.GCP_REGION }}"
+          SERVICE="${{ env.SERVICE_NAME }}"
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${SERVICE}/${SERVICE}:latest"
+          echo "Deploying image: ${IMAGE}"
+          gcloud run deploy "${SERVICE}" \
+            --image "${IMAGE}" \
+            --platform managed \
+            --region "${REGION}" \
+            --allow-unauthenticated \
+            --port 3001 \
+            --memory 512Mi \
+            --cpu 1 \
+            --max-instances 10 \
+            --set-env-vars="NODE_ENV=production"
+
+      - name: Get Cloud Run URL
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region=${{ env.GCP_REGION }} \
+            --format='value(status.url)')
+          echo "🌐 Service deployed at: $URL"
+          echo "SERVICE_URL=$URL" >> $GITHUB_ENV

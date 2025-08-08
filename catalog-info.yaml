@@ -1,0 +1,12 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: counter-app
+  description: Testing Docker integration
+  annotations:
+    github.com/project-slug: Abhi232003/counter-app
+    github.com/workflows: ci.yml
+spec:
+  type: service
+  lifecycle: experimental
+  owner: group:default/developers
